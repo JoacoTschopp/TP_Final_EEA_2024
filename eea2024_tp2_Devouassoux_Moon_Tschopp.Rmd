@@ -1,0 +1,394 @@
+---
+title: "Modelo de Regresión Funcional con CanadianWeather"
+author: "Devouassoux, Julian - Moon, Joseph - Tschopp, Joaquín"
+title2: Análisis de Datos Meteorológicos
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+# Cargar las librerías necesarias
+library(fda)
+library(ggplot2)
+library(tidyr)
+library(dplyr)
+library(caret)
+library(Metrics)
+library(MASS)
+```
+
+Este notebook utiliza el dataset CanadianWeather, que contiene datos meteorológicos diarios de 35 estaciones en Canadá, para un año. El análisis comienza con la transformación de la variable de temperatura media diaria en representaciones funcionales mediante el uso de B-splines, tanto con penalización como sin penalización. Adicionalmente, se aplica Análisis de Componentes Principales (PCA) para reducir la dimensionalidad de los datos funcionales.<br>
+
+Posteriormente, el dataset se divide en conjuntos de entrenamiento y prueba para garantizar una evaluación imparcial de los modelos. Se entrena un modelo de regresión funcional cuyo objetivo es predecir el total anual de lluvias en cada estación. Como punto de comparación, se entrena también un modelo de regresión lineal simple robusta, utilizando como variable explicativa el promedio anual de temperaturas de cada estación y como variable objetivo el total anual de precipitaciones.<br>
+
+Finalmente, se evalúa el desempeño de ambos modelos mediante métricas como el RMSE (Root Mean Squared Error) y el MAE (Mean Absolute Error). Este enfoque permite comparar el rendimiento del análisis funcional con el enfoque clásico de regresión lineal, proporcionando una visión integral de las ventajas y limitaciones de cada método.<br>
+
+Ref.: https://cran.r-project.org/web/packages/fda/index.html
+
+# Carga y Visualización del Dataset
+
+```{r cargar-datos, echo=TRUE}
+# Cargar los datos del paquete 'fda'
+data("CanadianWeather")
+df_canadian <- CanadianWeather
+
+# Mostrar un resumen y estructura del dataset
+summary(df_canadian)
+str(df_canadian)
+
+# Extraer solo la temperatura media diaria
+dailyTemp <- df_canadian$dailyAv[, , "Temperature.C"]
+
+df_tdiaria <- data.frame(Day = rep(1:365, times = ncol(dailyTemp)),
+                         Station = rep(colnames(dailyTemp), each = nrow(dailyTemp)),
+                         Temperature = as.vector(dailyTemp))
+
+# Estructura y visualiza pimeros registros
+str(df_tdiaria)
+
+head(df_tdiaria)
+```
+
+## Gráfico de la temperatura durante el año
+
+```{r}
+# Convertir el objeto funcional en un data frame para la visualización
+df_tdiaria_long <- pivot_longer(df_tdiaria, cols = Temperature, names_to = "Variable", values_to = "Value")
+
+# Graficar la temperatura media diaria para las estaciones
+ggplot(df_tdiaria_long, aes(x = Day, y = Value, color = Station)) +
+  geom_line() +
+  ggtitle("Temperatura Media Diaria para Estaciones en Canadá") +
+  xlab("Día del Año") +
+  ylab("Temperatura (°C)") +
+  theme_minimal()
+```
+
+## Calculamos el target a predecir
+
+Cantidad total de precipitación por cada estación anualmente:
+
+```{r}
+# Calcular la precipitación total anual para cada estación como variable escalar de respuesta
+precip_anual <- colSums(df_canadian$dailyAv[, , "Precipitation.mm"])
+
+print(precip_anual)
+```
+
+## Dataset para Regresión lineal simple
+
+```{r}
+# Crear un data frame con el promedio de las temperaturas y lluvia total para cada ciudad
+mean_temp <- colMeans(df_canadian$dailyAv[, , "Temperature.C"], na.rm = TRUE)
+total_precip <- colSums(df_canadian$dailyAv[, , "Precipitation.mm"])
+
+
+# Crear el data frame con las columnas solicitadas
+df_cities <- data.frame(
+  Ciudad = colnames(dailyTemp),
+  Promedio_Temperatura = mean_temp,
+  Lluvia_Total = total_precip
+)
+
+# Mostrar los primeros registros del data frame creado
+head(df_cities)
+
+# Crear el gráfico de dispersión
+ggplot(data = df_cities, aes(x = Promedio_Temperatura, y = Lluvia_Total)) +
+  geom_point(color = "blue", alpha = 0.7) +  # Puntos de dispersión
+  labs(
+    title = "Relación entre Temperatura y Lluvia Total",
+    x = "Temperatura (°C)",
+    y = "Lluvia Total (mm)"
+  ) +
+  theme_minimal()
+
+```
+
+# Transformaciones Funcionales
+
+## Representación Base Sin Penalización
+
+La función Data2fd de la librería fda en R se utiliza para transformar datos discretos, como observaciones diarias o mensuales, en funciones suaves continuas. Este proceso se realiza mediante la expansión en una base, en nuestro caso B-splines, que permite representar los datos como combinaciones lineales de estas funciones base. Al especificar los nodos o puntos de ruptura (knots) y el número de funciones base, Data2fd ajusta las curvas suavizadas a los datos originales. Esta representación funcional facilita el análisis de patrones subyacentes y la aplicación de regresiones funcionales o descomposiciones en componentes principales, que serían complejas de realizar con datos discretos. Esto mismo aplicaremos en este trabajo.
+
+```{r}
+# Reorganizar los datos: Crear una matriz con 365 filas (días) y 35 columnas (estaciones)
+temp_matrix <- matrix(
+  data = df_tdiaria$Temperature,  # Temperaturas desestacionalizadas
+  nrow = 365,                       # Filas: días del año
+  ncol = length(unique(df_tdiaria$Station)),  # Columnas: estaciones
+  byrow = FALSE                     # Ordenar por día
+)
+
+# Definir una base de funciones B-spline para la temperatura
+n_basis <- 4
+range_time <- range(df_tdiaria$Day)
+basis_unpenalized  <- create.bspline.basis(rangeval = range_time, nbasis = n_basis)
+
+
+# Crear el objeto funcional para la temperatura
+fd_unpenalized <- Data2fd(
+  argvals = 1:365,  
+  y = temp_matrix,  
+  basisobj = basis_unpenalized   
+)
+
+# Graficar las curvas funcionales sin penalización
+plot(fd_unpenalized, main = "Representación Base Sin Penalización",
+     xlab = "Día del Año", ylab = "Temperatura (°C)")
+```
+
+## Representación Base Con Penalización
+
+En esta sección, se utiliza la función fdPar de la librería fda para definir un objeto funcional con penalización, lo que permite controlar la suavidad de las curvas ajustadas a los datos. Este objeto se combina con la función smooth.basis, que ajusta las curvas funcionales considerando la penalización especificada en fdPar. La penalización se establece mediante un parámetro de suavidad (lambda), que regula el equilibrio entre el ajuste a los datos originales y la suavidad de la curva resultante. Este enfoque es especialmente útil cuando se busca evitar el sobreajuste de las funciones base a los datos discretos, logrando representaciones más robustas y generalizables.
+
+```{r}
+# Definir una penalización basada en la segunda derivada
+lambda <- 0.001  # Parámetro de suavidad
+fdPar_penalized <- fdPar(basis_unpenalized, Lfdobj = 2, lambda = lambda)
+
+# Ajustar las funciones con penalización
+fd_penalized <- smooth.basis(argvals = 1:365, y = temp_matrix, fdParobj = fdPar_penalized)$fd
+
+# Graficar las curvas funcionales con penalización
+plot(fd_penalized, main = "Representación Base Con Penalización",
+     xlab = "Día del Año", ylab = "Temperatura (°C)")
+
+```
+
+## Representación por PCA (Análisis de Componentes Principales)
+
+```{r}
+# Realizar un análisis de componentes principales en las curvas sin penalización
+pca_result <- pca.fd(fd_unpenalized, nharm = 1)
+
+# Graficar los tres primeros armónicos principales
+plot(pca_result$harmonics, main = "Armónicos Principales (PCA)",
+     xlab = "Día del Año", ylab = "Valor de la Función",
+     lwd = 2) 
+
+# Extraer las funciones principales (harmónicos) y puntajes
+fd_pca <- pca_result$harmonics  # Funciones principales
+scores_pca <- pca_result$scores  # Puntajes de PCA
+
+```
+
+```{r}
+# Obtener los porcentajes de varianza explicada
+varianza_explicada <- pca_result$varprop * 100
+
+# Mostrar los porcentajes de representación por cada componente
+cat("Porcentajes de varianza explicada por cada componente:\n")
+print(varianza_explicada)
+```
+
+# Preparación de Datos para Entrenamiento y Test
+
+## División del Dataset: 70% Entrenamiento y 30% Test
+
+```{r}
+# Definir índices para la división de los datos en entrenamiento y prueba
+set.seed(123)
+n_stations <- ncol(fd_unpenalized$coefs)
+train_indices <- sample(1:n_stations, size = floor(0.7 * n_stations))
+test_indices <- setdiff(1:n_stations, train_indices)
+
+# Respuesta escalar para entrenamiento y prueba
+train_response <- precip_anual[train_indices]
+test_response <- precip_anual[test_indices]
+
+test_response
+```
+
+# Entrenamiento de Modelos para las Diferentes Transformaciones
+
+```{r}
+# Función para calcular RMSE y MAE
+calculate_metrics <- function(predicted, actual) {
+  rmse <- sqrt(mean((predicted - actual)^2))  # Error cuadrático medio
+  mae <- mean(abs(predicted - actual))       # Error absoluto medio
+  return(list(RMSE = rmse, MAE = mae))
+}
+
+# Listas para almacenar resultados
+metrics <- list()
+```
+
+## Regresión Lineal Simple Robusta
+
+Tomamos como Baseline la regresión lineal simple robusta.
+
+
+```{r}
+# Dividir en conjuntos de entrenamiento y prueba
+train_data <- df_cities[train_indices, ]
+test_data <- df_cities[test_indices, ]
+
+# Mostrar los primeros registros de los conjuntos de entrenamiento y prueba
+head(train_data)
+head(test_data)
+```
+
+```{r}
+# Definir el modelo de regresión lineal robusta
+lm_model <- rlm(Lluvia_Total ~ Promedio_Temperatura, data = train_data)
+
+# Mostrar el resumen del modelo ajustado
+summary(lm_model)
+```
+```{r}
+# Crear el gráfico de dispersión con la línea de regresión
+ggplot(data = df_cities, aes(x = Promedio_Temperatura, y = Lluvia_Total)) +
+  geom_point(color = "blue", alpha = 0.7) +  # Puntos de dispersión
+  geom_smooth(method = "lm", se = FALSE, color = "red", formula = y ~ x) +  # Línea de regresión
+  labs(
+    title = "Relación entre Temperatura y Lluvia Total con Línea de Regresión",
+    x = "Temperatura (°C)",
+    y = "Lluvia Total (mm)"
+  ) +
+  theme_minimal()
+```
+
+```{r}
+# Predecir en el conjunto de prueba
+predicciones <- predict(lm_model, newdata = test_data)
+
+# Calcular métricas de evaluación
+rmse_value <- rmse(test_data$Lluvia_Total, predicciones)
+mae_value <- mae(test_data$Lluvia_Total, predicciones)
+
+# Agregar las métricas al data frame
+metrics$linear <- list(RMSE = rmse_value, MAE = mae_value)
+
+# Mostrar las métricas de evaluación
+cat("RMSE en el conjunto de prueba: ", rmse_value, "\n")
+cat("MAE en el conjunto de prueba: ", mae_value, "\n")
+```
+
+
+## Entrenamiento y Prueba para Representación sin Penalización
+
+El modelo se escribe como:
+
+$$
+Y_i = \int \beta(s) X_i(s) ds + \epsilon_i
+$$
+
+donde \( x_i(s) \) son las funciones explicativas y \( \beta_i(s) \) son las funciones coeficientes.
+
+
+```{r}
+# Conjuntos de entrenamiento y prueba
+train_fd <- fd(fd_unpenalized$coefs[, train_indices], basis_unpenalized)
+test_fd <- fd(fd_unpenalized$coefs[, test_indices], basis_unpenalized)
+
+xfdlist <- list(train_fd)
+
+# Crear el objeto betalist
+betalist <- list(fdPar(basis_unpenalized))                                                                           
+
+# Entrenar el modelo
+model_unpenalized <- fRegress(y = train_response, xfdlist = xfdlist, betalist = betalist)
+
+# Convertir test_fd a una lista
+newdata <- list(test_fd)
+
+# Predicciones en el conjunto de prueba
+predicted_unpenalized <- predict(model_unpenalized, newdata)
+
+# Calcular métricas de evaluación
+metrics$unpenalized <- calculate_metrics(predicted_unpenalized, test_response)
+
+# Mostrar las métricas de evaluación
+cat("RMSE en el conjunto de prueba: ", metrics$unpenalized$RMSE, "\n")
+cat("MAE en el conjunto de prueba: ", metrics$unpenalized$MAE, "\n")
+```
+
+## Entrenamiento y Prueba para Representación con Penalización
+
+```{r}
+# Crear los conjuntos de entrenamiento y prueba con penalización
+train_fd_penalized <- fd(fd_penalized$coefs[, train_indices], basis_unpenalized)
+test_fd_penalized <- fd(fd_penalized$coefs[, test_indices], basis_unpenalized)
+
+# Crear xfdlist y betalist
+xfdlist_penalized <- list(train_fd_penalized)
+betalist_penalized <- list(fdPar(basis_unpenalized, Lfdobj = 2, lambda = lambda))
+
+# Entrenar el modelo con penalización
+model_penalized <- fRegress(y = train_response, xfdlist = xfdlist_penalized, betalist = betalist_penalized)
+
+# Predicciones en el conjunto de prueba con penalización
+newdata_penalized <- list(test_fd_penalized)
+predicted_penalized <- predict(model_penalized, newdata_penalized)
+
+# Calcular métricas de evaluación
+metrics$penalized <- calculate_metrics(predicted_penalized, test_response)
+
+# Mostrar las métricas de evaluación
+cat("RMSE en el conjunto de prueba: ", metrics$penalized$RMSE, "\n")
+cat("MAE en el conjunto de prueba: ", metrics$penalized$MAE, "\n")
+```
+
+## Entrenamiento y Prueba para Representación PCA
+
+```{r}
+# Dividir los puntajes en conjuntos de entrenamiento y prueba
+train_pca <- pca_result$scores[train_indices, ]  # Puntajes para el conjunto de entrenamiento
+test_pca <- pca_result$scores[test_indices, ]    # Puntajes para el conjunto de prueba
+
+# Crear el data frame de entrenamiento
+train_pca_df <- as.data.frame(train_pca)
+train_pca_df$response <- train_response
+
+# Ajustar el modelo lineal con los puntajes de PCA
+model_pca <- lm(response ~ ., data = train_pca_df)
+
+# Crear el data frame de prueba
+test_pca_df <- as.data.frame(test_pca)
+colnames(test_pca_df) <- colnames(train_pca_df)[-ncol(train_pca_df)]
+
+# Realizar predicciones
+predicted_pca <- predict(model_pca, newdata = test_pca_df)
+
+# Calcular métricas
+metrics$pca <- calculate_metrics(predicted_pca, test_response)
+
+# Mostrar las métricas de evaluación
+cat("RMSE en el conjunto de prueba: ", metrics$pca$RMSE, "\n")
+cat("MAE en el conjunto de prueba: ", metrics$pca$MAE, "\n")
+```
+
+# Resumen de Resultados
+
+```{r}
+# Crear el data frame con las métricas de las cuatro representaciones
+metrics_df <- data.frame(
+  Transformation = c("Lineal", "Sin Penalizar", "Con Penalizacion", "PCA"),
+  RMSE = c(metrics$linear$RMSE, metrics$unpenalized$RMSE, metrics$penalized$RMSE, metrics$pca$RMSE),
+  MAE = c(metrics$linear$MAE, metrics$unpenalized$MAE, metrics$penalized$MAE, metrics$pca$MAE)
+)
+
+print(metrics_df)
+
+# Asegurar el orden de la columna Transformation
+metrics_df$Transformation <- factor(metrics_df$Transformation, 
+                                     levels = c("Lineal", "Sin Penalizar", "Con Penalizacion", "PCA"))
+
+# Crear el gráfico con el orden respetado
+ggplot(metrics_df, aes(x = Transformation)) +
+  geom_bar(aes(y = RMSE, fill = "RMSE"), stat = "identity", position = position_dodge(width = 0.5), alpha = 0.7) +
+  geom_bar(aes(y = MAE, fill = "MAE"), stat = "identity", position = position_dodge(width = 0.5), alpha = 0.7) +
+  scale_fill_manual(values = c("RMSE" = "blue", "MAE" = "red")) +
+  ggtitle("Comparación de RMSE y MAE para cada Representación") +
+  ylab("Error") +
+  theme_minimal() +
+  theme(legend.title = element_blank())
+```
+
+## Conclusiones
+
+Para este dataset en particular, los resultados muestran que la representación sin penalización ofrece el mejor desempeño predictivo, con los valores más bajos de RMSE (152.58) y MAE (130.77). La representación con penalización tiene un desempeño ligeramente inferior, indicando que la regularización puede haber reducido información relevante. Por otro lado, la transformación PCA y el modelo lineal simple presentan los peores resultados, con mayores errores tanto en RMSE como en MAE, sugiriendo que estas técnicas no capturan adecuadamente las relaciones entre la temperatura y la precipitación total en este caso específico. Esto destaca la importancia de seleccionar cuidadosamente las transformaciones funcionales según las características del dataset.
